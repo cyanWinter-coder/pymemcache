@@ -112,9 +112,7 @@ class AWSElastiCacheHashClient(HashClient):
         self.key_prefix = key_prefix
         self.ignore_exc = ignore_exc
         self.allow_unicode_keys = allow_unicode_keys
-        self._failed_clients = {}
-        self._dead_clients = {}
-        self._last_dead_check_time = time.time()
+        self._init_failure_state()
 
         self.hasher = hasher()
 

@@ -1,5 +1,6 @@
 import collections
 import socket
+import threading
 import time
 import logging
 
@@ -13,6 +14,16 @@ from pymemcache.client.rendezvous import RendezvousHash
 from pymemcache.exceptions import MemcacheError
 
 logger = logging.getLogger(__name__)
+
+# Return value of ``_begin_server_call`` when the node is temporarily
+# unavailable (its retry window has not elapsed yet, or another caller is
+# already probing it).
+_SKIP = object()
+
+# Return value of ``_begin_server_call`` when the node has exhausted its retry
+# attempts and has just been moved to the dead pool. The historical behavior is
+# to still attempt the call once against the existing client.
+_DEAD = object()
 
 
 class HashClient:
@@ -82,9 +93,7 @@ class HashClient:
         self.key_prefix = key_prefix
         self.ignore_exc = ignore_exc
         self.allow_unicode_keys = allow_unicode_keys
-        self._failed_clients = {}
-        self._dead_clients = {}
-        self._last_dead_check_time = time.time()
+        self._init_failure_state()
 
         self.hasher = hasher()
 
@@ -118,6 +127,21 @@ class HashClient:
         self.encoding = encoding
         self.tls_context = tls_context
 
+    def _init_failure_state(self):
+        """Initialize (or reset) the shared node health state.
+
+        All node health bookkeeping lives behind a single short-lived lock.
+        The lock is only held while dictionaries and flags are mutated;
+        network requests are always performed without it, so a slow or
+        unreachable node cannot block callers talking to healthy nodes.
+        """
+        self._failed_clients = {}
+        self._dead_clients = {}
+        self._last_dead_check_time = time.time()
+        # Guards ``_failed_clients``, ``_dead_clients`` and the hasher's node
+        # membership. It is never held while a network operation is in flight.
+        self._state_lock = threading.RLock()
+
     def _make_client_key(self, server):
         if isinstance(server, (list, tuple)) and len(server) == 2:
             return "%s:%s" % server
@@ -137,8 +161,25 @@ class HashClient:
             client.client_class = self.client_class
 
         key = self._make_client_key(server)
-        self.clients[key] = client
-        self.hasher.add_node(key)
+        with self._state_lock:
+            self.clients[key] = client
+            self.hasher.add_node(key)
+
+    def _remove_server_locked(self, server, dead_time):
+        """Move ``server`` to the dead pool.
+
+        Caller must hold ``_state_lock``.
+        """
+        key = self._make_client_key(server)
+        # Any in-flight recovery attempt for the node is superseded by the
+        # dead transition, and the node leaves the failed pool entirely.
+        self._failed_clients.pop(server, None)
+        self._dead_clients[server] = dead_time
+        try:
+            self.hasher.remove_node(key)
+        except ValueError:
+            # The node may already have been removed by a concurrent caller.
+            logger.debug("server %s was no longer in rotation", server)
 
     def remove_server(self, server, port=None) -> None:
         # To maintain backward compatibility, if a port is provided, assume
@@ -148,23 +189,32 @@ class HashClient:
                 raise TypeError("Server must be a string when passing port.")
             server = (server, port)
 
-        key = self._make_client_key(server)
         dead_time = time.time()
-        self._failed_clients.pop(server)
-        self._dead_clients[server] = dead_time
-        self.hasher.remove_node(key)
+        with self._state_lock:
+            self._remove_server_locked(server, dead_time)
 
     def _retry_dead(self) -> None:
         current_time = time.time()
-        ldc = self._last_dead_check_time
-        # We have reached the retry timeout
-        if current_time - ldc > self.dead_timeout:
+        with self._state_lock:
+            ldc = self._last_dead_check_time
+            # We have reached the retry timeout
+            if current_time - ldc <= self.dead_timeout:
+                return
+
             candidates = []
             for server, dead_time in self._dead_clients.items():
                 if current_time - dead_time > self.dead_timeout:
                     candidates.append(server)
             for server in candidates:
                 logger.debug("bringing server back into rotation %s", server)
+                # The node re-enters rotation as a healthy node with a clean
+                # slate: any failure metadata left behind by the final
+                # pre-dead request is dropped so its retry budget is restored
+                # instead of being carried over from the previous incarnation.
+                self._failed_clients.pop(server, None)
+                # ``add_server`` re-acquires the reentrant lock and puts the
+                # node back in the hasher atomically, so concurrent callers
+                # can never observe half-finished re-additions.
                 self.add_server(server)
                 del self._dead_clients[server]
             self._last_dead_check_time = current_time
@@ -180,41 +230,102 @@ class HashClient:
         if self._dead_clients:
             self._retry_dead()
 
-        server = self.hasher.get_node(server_key)
-        # We've ran out of servers to try
-        if server is None:
-            if self.ignore_exc is True:
-                return None, key
-            raise MemcacheError("All servers seem to be down right now")
+        with self._state_lock:
+            server = self.hasher.get_node(server_key)
+            # We've ran out of servers to try
+            if server is None:
+                if self.ignore_exc is True:
+                    return None, key
+                raise MemcacheError("All servers seem to be down right now")
 
-        return self.clients[server], key
+            return self.clients[server], key
+
+    def _begin_server_call(self, server):
+        """Decide whether a call to ``server`` may access the network.
+
+        This is the single shared gate for every command, including batch and
+        multi-node operations. It returns one of:
+
+        * ``(True, generation)``: the caller owns the node's recovery probe
+          and must run the request now, without holding ``_state_lock``.
+        * ``(False, _SKIP)``: the node's retry window is still open or another
+          caller is already probing it. The node must not be contacted.
+        * ``(False, _DEAD)``: the node just exhausted its retry attempts and
+          was moved to the dead pool. Historical behavior is preserved by
+          still allowing the caller to attempt the request once.
+        """
+        with self._state_lock:
+            failed_metadata = self._failed_clients.get(server)
+            if failed_metadata is None:
+                # Healthy node: nothing to coordinate, no extra locking is
+                # imposed on the actual network request.
+                return True, None
+
+            if failed_metadata["attempts"] >= self.retry_attempts:
+                # We've reached our max retry attempts, mark the server dead.
+                logger.debug("marking server as dead: %s", server)
+                self._remove_server_locked(server, time.time())
+                return False, _DEAD
+
+            if failed_metadata["probing"]:
+                # Another caller is already running the recovery probe; this
+                # caller must not touch the node so only one probe happens.
+                logger.debug("recovery probe already in progress: %s", server)
+                return False, _SKIP
+
+            if time.time() - failed_metadata["failed_time"] <= self.retry_timeout:
+                # The retry window has not elapsed yet.
+                return False, _SKIP
+
+            # The retry window has elapsed. This caller wins the probe and is
+            # solely responsible for re-validating the node.
+            logger.debug("retrying failed server: %s", server)
+            failed_metadata["probing"] = True
+            return True, failed_metadata["generation"]
+
+    def _finish_probe_success(self, server, generation):
+        """Clear the failed state after a successful recovery probe.
+
+        The failure is only cleared when no newer failure superseded the
+        probe while it was in flight. An earlier request succeeding after a
+        newer failure must never resurrect the node.
+        """
+        with self._state_lock:
+            failed_metadata = self._failed_clients.get(server)
+            if failed_metadata is None or failed_metadata["generation"] != generation:
+                logger.debug(
+                    "ignoring stale probe success for server %s", server
+                )
+                return
+            self._failed_clients.pop(server)
+
+    def _release_server_probe(self, server):
+        """Release the in-progress probe flag without changing the state.
+
+        Used when a probe fails for a reason that does not mark the node as
+        failed (a non-socket exception), so a later caller can probe again.
+        """
+        with self._state_lock:
+            failed_metadata = self._failed_clients.get(server)
+            if failed_metadata is not None:
+                failed_metadata["probing"] = False
 
     def _safely_run_func(self, client, func, default_val, *args, **kwargs):
+        is_probe = False
         try:
-            if client.server in self._failed_clients:
-                # This server is currently failing, lets check if it is in
-                # retry or marked as dead
-                failed_metadata = self._failed_clients[client.server]
+            should_run, probe_generation = self._begin_server_call(client.server)
+            if not should_run:
+                if probe_generation is _DEAD:
+                    # Preserve the historical behavior of attempting the call
+                    # once against the just-dead node.
+                    return func(*args, **kwargs)
+                return default_val
 
-                # we haven't tried our max amount yet, if it has been enough
-                # time lets just retry using it
-                if failed_metadata["attempts"] < self.retry_attempts:
-                    failed_time = failed_metadata["failed_time"]
-                    if time.time() - failed_time > self.retry_timeout:
-                        logger.debug("retrying failed server: %s", client.server)
-                        result = func(*args, **kwargs)
-                        # we were successful, lets remove it from the failed
-                        # clients
-                        self._failed_clients.pop(client.server)
-                        return result
-                    return default_val
-                else:
-                    # We've reached our max retry attempts, we need to mark
-                    # the sever as dead
-                    logger.debug("marking server as dead: %s", client.server)
-                    self.remove_server(client.server)
-
+            is_probe = probe_generation is not None
             result = func(*args, **kwargs)
+
+            if is_probe:
+                self._finish_probe_success(client.server, probe_generation)
             return result
 
         # Connecting to the server fail, we should enter
@@ -231,6 +342,10 @@ class HashClient:
         except Exception:
             # any exceptions that aren't socket.error we need to handle
             # gracefully as well
+            if is_probe:
+                # A non-socket failure does not change the node's state, but
+                # the probe slot must be freed so recovery can be retried.
+                self._release_server_probe(client.server)
             if not self.ignore_exc:
                 raise
 
@@ -239,38 +354,28 @@ class HashClient:
     def _safely_run_set_many(self, client, values, *args, **kwargs):
         failed = []
         succeeded = []
+        is_probe = False
         try:
-            if client.server in self._failed_clients:
-                # This server is currently failing, lets check if it is in
-                # retry or marked as dead
-                failed_metadata = self._failed_clients[client.server]
+            should_run, probe_generation = self._begin_server_call(client.server)
+            if not should_run:
+                if probe_generation is _DEAD:
+                    # Preserve the historical behavior of attempting the call
+                    # once against the just-dead node.
+                    succeeded, failed, err = self._set_many(
+                        client, values, *args, **kwargs
+                    )
+                    if err is not None:
+                        raise err
+                    return failed
+                return list(values.keys())
 
-                # we haven't tried our max amount yet, if it has been enough
-                # time lets just retry using it
-                if failed_metadata["attempts"] < self.retry_attempts:
-                    failed_time = failed_metadata["failed_time"]
-                    if time.time() - failed_time > self.retry_timeout:
-                        logger.debug("retrying failed server: %s", client.server)
-                        succeeded, failed, err = self._set_many(
-                            client, values, *args, **kwargs
-                        )
-                        if err is not None:
-                            raise err
-                        # we were successful, lets remove it from the failed
-                        # clients
-                        self._failed_clients.pop(client.server)
-                        return failed
-                    return values.keys()
-                else:
-                    # We've reached our max retry attempts, we need to mark
-                    # the sever as dead
-                    logger.debug("marking server as dead: %s", client.server)
-                    self.remove_server(client.server)
-
+            is_probe = probe_generation is not None
             succeeded, failed, err = self._set_many(client, values, *args, **kwargs)
             if err is not None:
                 raise err
 
+            if is_probe:
+                self._finish_probe_success(client.server, probe_generation)
             return failed
 
         # Connecting to the server fail, we should enter
@@ -287,34 +392,47 @@ class HashClient:
         except Exception:
             # any exceptions that aren't socket.error we need to handle
             # gracefully as well
+            if is_probe:
+                self._release_server_probe(client.server)
             if not self.ignore_exc:
                 raise
 
             return list(set(values.keys()) - set(succeeded))
 
     def _mark_failed_server(self, server):
-        # This client has never failed, lets mark it for failure
-        if server not in self._failed_clients and self.retry_attempts > 0:
-            self._failed_clients[server] = {
-                "failed_time": time.time(),
-                "attempts": 0,
-            }
-        # We aren't allowing any retries, we should mark the server as
-        # dead immediately
-        elif server not in self._failed_clients and self.retry_attempts <= 0:
-            self._failed_clients[server] = {
-                "failed_time": time.time(),
-                "attempts": 0,
-            }
-            logger.debug("marking server as dead %s", server)
-            self.remove_server(server)
-        # This client has failed previously, we need to update the metadata
-        # to reflect that we have attempted it again
-        else:
-            failed_metadata = self._failed_clients[server]
+        with self._state_lock:
+            # A node that has already been moved to the dead pool is managed
+            # exclusively by the dead reaper; a failure of the legacy
+            # one-shot call against it must not resurrect failure metadata
+            # (otherwise its retry budget would be polluted on revival).
+            if server in self._dead_clients:
+                return
+
+            failed_metadata = self._failed_clients.get(server)
+            if failed_metadata is None:
+                # This client has never failed, lets mark it for failure.
+                # ``generation`` identifies this failure epoch: requests that
+                # started before it may only clear this exact state.
+                self._failed_clients[server] = {
+                    "failed_time": time.time(),
+                    "attempts": 0,
+                    "generation": 1,
+                    "probing": False,
+                }
+                # We aren't allowing any retries, mark the server dead
+                # immediately.
+                if self.retry_attempts <= 0:
+                    logger.debug("marking server as dead %s", server)
+                    self._remove_server_locked(server, time.time())
+                return
+
+            # This client has failed previously: record another attempt,
+            # start a fresh failure epoch, and free any probe slot so the
+            # next retry window can re-probe the node.
             failed_metadata["attempts"] += 1
             failed_metadata["failed_time"] = time.time()
-            self._failed_clients[server] = failed_metadata
+            failed_metadata["generation"] += 1
+            failed_metadata["probing"] = False
 
     def _run_cmd(self, cmd, key, default_val, *args, **kwargs):
         client, key = self._get_client(key)
@@ -341,7 +459,9 @@ class HashClient:
         return succeeded, failed, None
 
     def close(self):
-        for client in self.clients.values():
+        # Snapshot the clients: closing a client must not mutate the dict we
+        # iterate over, and no state lock is held while network I/O happens.
+        for client in list(self.clients.values()):
             self._safely_run_func(client, client.close, False)
 
     disconnect_all = close
@@ -452,7 +572,7 @@ class HashClient:
 
     def stats(self, *args, **kwargs):
         result = list()
-        for key, client in self.clients.items():
+        for key, client in list(self.clients.items()):
             result.append(
                 (
                     key,
@@ -462,9 +582,9 @@ class HashClient:
         return result
 
     def flush_all(self, *args, **kwargs) -> None:
-        for client in self.clients.values():
+        for client in list(self.clients.values()):
             self._safely_run_func(client, client.flush_all, False, *args, **kwargs)
 
     def quit(self) -> None:
-        for client in self.clients.values():
+        for client in list(self.clients.values()):
             self._safely_run_func(client, client.quit, False)
